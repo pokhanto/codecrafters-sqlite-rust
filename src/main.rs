@@ -28,6 +28,12 @@ fn main() -> Result<()> {
 
             // Uncomment this block to pass the first stage
             println!("database page size: {}", page_size);
+
+            let mut first_page_header = [0; 5];
+            file.read_exact(&mut first_page_header)?;
+            let num_of_tables = u16::from_be_bytes([first_page_header[3], first_page_header[4]]);
+
+            println!("number of tables: {}", num_of_tables);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
