@@ -1,6 +1,177 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
+use itertools::Itertools;
+use nom::bytes;
 use std::fs::File;
-use std::io::prelude::*;
+use std::io::{prelude::*, SeekFrom};
+
+fn decode_varint(bytes: &[u8]) -> Result<(u64, usize)> {
+    let mut result = 0;
+    let mut shift = 0;
+    let mut bytes_read = 0;
+    let mut bs = bytes.iter().copied();
+    loop {
+        let byte = bs.next().ok_or(anyhow!("no next byte"))?;
+        bytes_read += 1;
+        if bytes_read == 9 {
+            result = (result << shift) | u64::from(byte);
+            break;
+        }
+        result = (result << shift) | u64::from(byte & 0b0111_1111);
+        shift += 7;
+        if byte & 0b1000_0000 == 0 {
+            break;
+        }
+    }
+
+    Ok((result, bytes_read))
+}
+
+#[derive(Debug)]
+enum DataType {
+    String,
+    Int,
+    Unknown,
+}
+
+#[derive(Debug)]
+enum DataValue {
+    String(String),
+    Int(i8),
+    Unknown,
+}
+
+fn get_type_definition(type_code: u64) -> (DataType, usize) {
+    match type_code {
+        1 => (DataType::Int, 1),
+        _ => {
+            if type_code % 2 == 0 {
+                let size = ((type_code - 12) / 2) as usize;
+
+                (DataType::Unknown, size)
+            } else {
+                let size = ((type_code - 13) / 2) as usize;
+
+                (DataType::String, size)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DbPage {
+    rows: Vec<Vec<DataValue>>,
+}
+
+#[derive(Debug)]
+struct Db {
+    page_size: u16,
+    num_of_tables: u16,
+    file_path: String,
+}
+
+impl Db {
+    fn new(file_path: &str) -> Result<Self> {
+        let mut file = File::open(file_path)?;
+        // includes db header 100 + first page header 8
+        let mut bytes_to_read = [0; 108];
+        file.read_exact(&mut bytes_to_read)?;
+
+        let page_size = u16::from_be_bytes([bytes_to_read[16], bytes_to_read[17]]);
+        let num_of_tables = u16::from_be_bytes([bytes_to_read[103], bytes_to_read[104]]);
+
+        Ok(Self {
+            file_path: file_path.to_owned(),
+            page_size,
+            num_of_tables,
+        })
+    }
+
+    fn get_page(&self, page_number: u16) -> Result<DbPage> {
+        let start_offset = if page_number == 0 { 100 } else { 0 };
+
+        let mut file = File::open(&self.file_path)?;
+        let mut bytes_to_read = vec![0; (self.page_size - start_offset) as usize];
+        file.seek(SeekFrom::Start(
+            (page_number * self.page_size + start_offset) as u64,
+        ))?;
+        file.read_exact(&mut bytes_to_read)?;
+
+        let num_of_cells = u16::from_be_bytes([bytes_to_read[3], bytes_to_read[4]]);
+
+        let mut rows: Vec<Vec<DataValue>> = vec![];
+        let cell_data_start_length = 8;
+        for i in 0..num_of_cells {
+            // cell offset on the bottom of the page
+            let cell_start_offset = u16::from_be_bytes([
+                bytes_to_read[cell_data_start_length + (i * 2) as usize],
+                bytes_to_read[cell_data_start_length + (i * 2 + 1) as usize],
+            ]);
+
+            let mut row_offset: usize = (cell_start_offset - start_offset) as usize;
+            let (_cell_size, offset) = decode_varint(&bytes_to_read[row_offset..])?;
+            row_offset += offset;
+
+            let (_row_id, offset) = decode_varint(&bytes_to_read[row_offset..])?;
+            row_offset += offset;
+
+            let (header_size, offset) = decode_varint(&bytes_to_read[row_offset..])?;
+
+            let header_end_offset = row_offset + header_size as usize;
+            row_offset += offset;
+
+            let mut type_definitions: Vec<(DataType, usize)> = vec![];
+            while row_offset < header_end_offset {
+                let (content, offset) =
+                    decode_varint(&bytes_to_read[row_offset..header_end_offset])?;
+                row_offset += offset;
+
+                let type_definition = get_type_definition(content);
+                type_definitions.push(type_definition);
+            }
+
+            let mut row_data: Vec<DataValue> = vec![];
+            let mut values_offset = header_end_offset;
+            for type_definition in type_definitions {
+                let value_length = type_definition.1;
+                let value_bytes = &bytes_to_read[values_offset..values_offset + value_length];
+
+                match type_definition.0 {
+                    DataType::String => {
+                        let value = std::str::from_utf8(value_bytes)?;
+                        row_data.push(DataValue::String(value.to_owned()));
+                    }
+                    _ => {
+                        row_data.push(DataValue::Unknown);
+                    }
+                }
+
+                values_offset += value_length;
+            }
+
+            rows.push(row_data);
+        }
+
+        Ok(DbPage { rows })
+    }
+
+    fn get_table_names(&self) -> Result<Vec<String>> {
+        let page = self.get_page(0)?;
+        let name_column_index = 2;
+
+        Ok(page
+            .rows
+            .iter()
+            .map(|row| {
+                Ok(
+                    match row.get(name_column_index).ok_or(anyhow!("no data"))? {
+                        DataValue::String(val) => val.clone(),
+                        _ => "".into(),
+                    },
+                )
+            })
+            .collect::<Result<Vec<String>>>()?)
+    }
+}
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -11,29 +182,20 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    let db = Db::new(&args[1])?;
+
     // Parse command and act accordingly
     let command = &args[2];
     match command.as_str() {
         ".dbinfo" => {
-            let mut file = File::open(&args[1])?;
-            let mut header = [0; 100];
-            file.read_exact(&mut header)?;
-
-            // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
-            #[allow(unused_variables)]
-            let page_size = u16::from_be_bytes([header[16], header[17]]);
-
             // You can use print statements as follows for debugging, they'll be visible when running tests.
             println!("Logs from your program will appear here!");
 
-            // Uncomment this block to pass the first stage
-            println!("database page size: {}", page_size);
-
-            let mut first_page_header = [0; 5];
-            file.read_exact(&mut first_page_header)?;
-            let num_of_tables = u16::from_be_bytes([first_page_header[3], first_page_header[4]]);
-
-            println!("number of tables: {}", num_of_tables);
+            println!("database page size: {}", db.page_size);
+            println!("number of tables: {}", db.num_of_tables);
+        }
+        ".tables" => {
+            println!("{:?}", db.get_table_names()?.join(" "));
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
