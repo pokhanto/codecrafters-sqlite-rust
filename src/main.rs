@@ -28,13 +28,20 @@ fn decode_varint(bytes: &[u8]) -> Result<(u64, usize)> {
 
 #[derive(Debug)]
 enum DataType {
+    Null,
     String,
-    Int,
+    Int8,
+    Int16,
+    Int24,
+    Int32,
+    Int48,
+    Int64,
     Unknown,
 }
 
 #[derive(Debug)]
 enum DataValue {
+    Null,
     String(String),
     Int(i8),
     Unknown,
@@ -42,7 +49,13 @@ enum DataValue {
 
 fn get_type_definition(type_code: u64) -> (DataType, usize) {
     match type_code {
-        1 => (DataType::Int, 1),
+        0 => (DataType::Null, 0),
+        1 => (DataType::Int8, 1),
+        2 => (DataType::Int16, 2),
+        3 => (DataType::Int24, 3),
+        4 => (DataType::Int32, 4),
+        5 => (DataType::Int48, 6),
+        6 => (DataType::Int64, 8),
         _ => {
             if type_code % 2 == 0 {
                 let size = ((type_code - 12) / 2) as usize;
@@ -60,6 +73,12 @@ fn get_type_definition(type_code: u64) -> (DataType, usize) {
 #[derive(Debug)]
 struct DbPage {
     rows: Vec<Vec<DataValue>>,
+}
+
+#[derive(Debug)]
+struct DbTableConfig {
+    table_name: String,
+    page_number: i8,
 }
 
 #[derive(Debug)]
@@ -87,7 +106,10 @@ impl Db {
     }
 
     fn get_page(&self, page_number: u16) -> Result<DbPage> {
-        let start_offset = if page_number == 0 { 100 } else { 0 };
+        let start_offset = if page_number == 1 { 100 } else { 0 };
+
+        // align since pages 1 based
+        let page_number = page_number - 1;
 
         let mut file = File::open(&self.file_path)?;
         let mut bytes_to_read = vec![0; (self.page_size - start_offset) as usize];
@@ -140,6 +162,13 @@ impl Db {
                         let value = std::str::from_utf8(value_bytes)?;
                         row_data.push(DataValue::String(value.to_owned()));
                     }
+                    DataType::Int8 => {
+                        let value_bytes =
+                            &bytes_to_read[values_offset..values_offset + value_length];
+                        let value = i8::from_be(value_bytes[0] as i8);
+                        row_data.push(DataValue::Int(value));
+                    }
+                    DataType::Null => row_data.push(DataValue::Null),
                     _ => {
                         row_data.push(DataValue::Unknown);
                     }
@@ -154,25 +183,57 @@ impl Db {
         Ok(DbPage { rows })
     }
 
-    fn get_table_names(&self) -> Result<Vec<String>> {
-        let page = self.get_page(0)?;
+    fn get_table_configs(&self) -> Result<Vec<DbTableConfig>> {
+        let page = self.get_page(1)?;
         let name_column_index = 2;
+        let page_column_index = 3;
 
         Ok(page
             .rows
             .iter()
-            .map(|row| {
-                Ok(
-                    match row.get(name_column_index).ok_or(anyhow!("no data"))? {
-                        DataValue::String(val) => val.clone(),
-                        _ => "".into(),
-                    },
-                )
+            .filter_map(|row| {
+                let table_name = match row.get(name_column_index).unwrap_or(&DataValue::Unknown) {
+                    DataValue::String(val) => val.clone(),
+                    _ => "".into(),
+                };
+                let page_number = match row.get(page_column_index).unwrap_or(&DataValue::Unknown) {
+                    DataValue::Int(val) => val.clone(),
+                    _ => 0,
+                };
+
+                if table_name == "" || page_number == 0 {
+                    return None;
+                }
+
+                Some(Ok(DbTableConfig {
+                    table_name,
+                    page_number,
+                }))
             })
-            .collect::<Result<Vec<String>>>()?)
+            .collect::<Result<Vec<DbTableConfig>>>()?)
+    }
+
+    fn get_table_names(&self) -> Result<Vec<String>> {
+        let table_configs = self.get_table_configs()?;
+
+        return Ok(table_configs
+            .iter()
+            .map(|config| config.table_name.clone())
+            .collect::<Vec<String>>());
+    }
+
+    fn get_table_page(&self, table_name: &str) -> Result<DbPage> {
+        let configs = self.get_table_configs()?;
+        let config = configs
+            .iter()
+            .find(|config| config.table_name == table_name)
+            .ok_or(anyhow!("No data for table"))?;
+
+        self.get_page(config.page_number as u16)
     }
 }
 
+// TODO: process all ?
 fn main() -> Result<()> {
     // Parse arguments
     let args = std::env::args().collect::<Vec<_>>();
@@ -188,16 +249,26 @@ fn main() -> Result<()> {
     let command = &args[2];
     match command.as_str() {
         ".dbinfo" => {
-            // You can use print statements as follows for debugging, they'll be visible when running tests.
-            println!("Logs from your program will appear here!");
-
             println!("database page size: {}", db.page_size);
             println!("number of tables: {}", db.num_of_tables);
         }
         ".tables" => {
             println!("{:?}", db.get_table_names()?.join(" "));
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
+        other => {
+            // TODO: case sensitivity
+            if other.starts_with("SELECT") {
+                let table_name = other.split_whitespace().last();
+                if let Some(table_name) = table_name {
+                    let table_page = db.get_table_page(table_name)?;
+                    println!("{}", table_page.rows.len());
+                } else {
+                    bail!("Requested table does not exist {}", command);
+                }
+            } else {
+                bail!("Missing or invalid command passed: {}", command);
+            }
+        }
     }
 
     Ok(())
