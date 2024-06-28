@@ -256,8 +256,7 @@ fn main() -> Result<()> {
             println!("{:?}", db.get_table_names()?.join(" "));
         }
         other => {
-            // TODO: case sensitivity
-            if other.starts_with("SELECT") {
+            if other.to_lowercase().starts_with("select") {
                 let table_name = other.split_whitespace().last();
                 if let Some(table_name) = table_name {
                     let table_page = db.get_table_page(table_name)?;
